@@ -39,8 +39,15 @@ const FALLBACK_MODELS = (
   .map((m) => m.trim())
   .filter(Boolean);
 
+/* Clean the key: remove spaces, quotes, line breaks and an accidental "NAME=" prefix. */
+const OPENROUTER_KEY = String(
+  process.env.OPENROUTER_API_KEY || '',
+)
+  .replace(/^\s*OPENROUTER_API_KEY\s*=\s*/i, '')
+  .replace(/["'\s]/g, '');
+
 const openrouter = new OpenAI({
-  apiKey: process.env.OPENROUTER_API_KEY,
+  apiKey: OPENROUTER_KEY || 'missing',
   baseURL: 'https://openrouter.ai/api/v1',
   defaultHeaders: {
     'HTTP-Referer': 'https://rydo-rent.expo.app',
@@ -3314,6 +3321,14 @@ app.get(
       model: MODEL,
       pocketbaseConfigured:
         Boolean(PB_URL),
+      keyPresent:
+        Boolean(OPENROUTER_KEY),
+      keyLength:
+        OPENROUTER_KEY.length,
+      keyLooksLikeOpenRouter:
+        OPENROUTER_KEY.startsWith(
+          'sk-or-',
+        ),
     });
   },
 );
@@ -3676,7 +3691,7 @@ app.post(
   async (req, res) => {
     try {
       if (
-        !process.env.OPENROUTER_API_KEY
+        !OPENROUTER_KEY
       ) {
         return res
           .status(503)
