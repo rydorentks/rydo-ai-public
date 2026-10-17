@@ -26,6 +26,19 @@ const PB_URL = process.env.POCKETBASE_URL || '';
 const MODEL =
   process.env.OPENROUTER_MODEL || 'openrouter/free';
 
+/*
+ * Free models are often busy or return an empty answer.
+ * If the main model fails, RYDO tries these in order.
+ * Override with OPENROUTER_FALLBACK_MODELS="model-a,model-b".
+ */
+const FALLBACK_MODELS = (
+  process.env.OPENROUTER_FALLBACK_MODELS ||
+  'meta-llama/llama-3.3-70b-instruct:free,google/gemma-3-27b-it:free,mistralai/mistral-small-3.2-24b-instruct:free,qwen/qwen3-235b-a22b:free,deepseek/deepseek-chat-v3.1:free'
+)
+  .split(',')
+  .map((m) => m.trim())
+  .filter(Boolean);
+
 const openrouter = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
   baseURL: 'https://openrouter.ai/api/v1',
@@ -3630,6 +3643,21 @@ function extractOpenRouterContent(completion) {
     return message.content.trim();
   }
 
+  if (Array.isArray(message.content)) {
+    const joined = message.content
+      .map((part) =>
+        typeof part === 'string'
+          ? part
+          : part?.text || '',
+      )
+      .join('')
+      .trim();
+
+    if (joined) {
+      return joined;
+    }
+  }
+
   /*
    * Some OpenRouter models can return reasoning
    * without normal content.
@@ -3765,33 +3793,48 @@ ${JSON.stringify(
 
       let content = '';
 
-      try {
-        const completion =
-          await openrouter.chat.completions.create(
-            {
-              model: MODEL,
-              messages,
-              temperature: 0.2,
-              max_tokens: 2200,
-            },
-          );
+      let usedModel = MODEL;
 
-        content =
-          extractOpenRouterContent(
-            completion,
-          );
+      const modelsToTry = [
+        MODEL,
+        ...FALLBACK_MODELS.filter(
+          (m) => m !== MODEL,
+        ),
+      ].slice(0, 4);
 
-        if (!content) {
+      for (const candidateModel of modelsToTry) {
+        try {
+          const completion =
+            await openrouter.chat.completions.create(
+              {
+                model: candidateModel,
+                messages,
+                temperature: 0.2,
+                max_tokens: 2200,
+              },
+            );
+
+          content =
+            extractOpenRouterContent(
+              completion,
+            );
+
+          if (content) {
+            usedModel = candidateModel;
+            break;
+          }
+
           console.warn(
-            'OpenRouter returned empty content.',
+            `OpenRouter returned empty content (model: ${candidateModel}, finish_reason: ${completion?.choices?.[0]?.finish_reason || 'n/a'}, upstream: ${completion?.model || 'n/a'}).`,
+          );
+        } catch (openRouterError) {
+          console.error(
+            `OpenRouter request error (model: ${candidateModel}):`,
+            openRouterError?.status || '',
+            openRouterError?.message ||
+              openRouterError,
           );
         }
-      } catch (openRouterError) {
-        console.error(
-          'OpenRouter request error:',
-          openRouterError?.message ||
-            openRouterError,
-        );
       }
 
       /*
@@ -3840,7 +3883,7 @@ ${JSON.stringify(
               fallbackPlans,
             role,
             businessApproved,
-            model: MODEL,
+            model: usedModel,
             fallback: true,
           });
         }
@@ -3960,7 +4003,7 @@ ${JSON.stringify(
 
         businessApproved,
 
-        model: MODEL,
+        model: usedModel,
       });
     } catch (error) {
       console.error(
