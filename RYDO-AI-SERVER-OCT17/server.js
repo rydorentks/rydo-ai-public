@@ -3794,6 +3794,7 @@ ${JSON.stringify(
       let content = '';
 
       let usedModel = MODEL;
+      const providerIssues = [];
 
       const modelsToTry = [
         MODEL,
@@ -3824,10 +3825,18 @@ ${JSON.stringify(
             break;
           }
 
+          providerIssues.push(
+            `${candidateModel}: empty answer (finish_reason ${completion?.choices?.[0]?.finish_reason || 'n/a'})`,
+          );
+
           console.warn(
             `OpenRouter returned empty content (model: ${candidateModel}, finish_reason: ${completion?.choices?.[0]?.finish_reason || 'n/a'}, upstream: ${completion?.model || 'n/a'}).`,
           );
         } catch (openRouterError) {
+          providerIssues.push(
+            `${candidateModel}: ${openRouterError?.status || ''} ${String(openRouterError?.message || openRouterError).slice(0, 220)}`,
+          );
+
           console.error(
             `OpenRouter request error (model: ${candidateModel}):`,
             openRouterError?.status || '',
@@ -3895,7 +3904,9 @@ ${JSON.stringify(
        */
       if (!content) {
         throw new Error(
-          'OpenRouter returned an empty response and no RYDO fallback was available.',
+          'OpenRouter returned an empty response and no RYDO fallback was available. Details: ' +
+            (providerIssues.join(' | ') ||
+              'none'),
         );
       }
 
