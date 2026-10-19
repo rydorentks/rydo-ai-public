@@ -286,17 +286,16 @@ function getDailyPrice(car) {
 }
 
 function getPrice3to6(car) {
-  return number(
-    car.price3to6 ?? 0,
-    0,
-  );
+  // RYDO-TIERS-4-7-8-25: the app now sells the 4-7 day tier (price4to7).
+  // The JSON key stays "price3to6" internally; older cars still use the old field.
+  const v = number(car.price4to7 ?? 0, 0);
+  return v > 0 ? v : number(car.price3to6 ?? 0, 0);
 }
 
 function getPrice7to29(car) {
-  return number(
-    car.price7to29 ?? 0,
-    0,
-  );
+  // 8-25 day tier (price8to25); the JSON key stays "price7to29" internally.
+  const v = number(car.price8to25 ?? 0, 0);
+  return v > 0 ? v : number(car.price7to29 ?? 0, 0);
 }
 
 function getWeekendPrice(car) {
@@ -787,8 +786,8 @@ function getRydoPlatformKnowledge() {
       'Vehicle photos',
       'Vehicle descriptions',
       'Vehicle pricing',
-      '3-6 day pricing',
-      '7-29 day pricing',
+      '4-7 day pricing',
+      '8-25 day pricing',
       'Weekend pricing',
       'Monthly pricing',
       'Delivery availability',
@@ -942,6 +941,8 @@ async function buildClientContext(
 
           weekendPrice:
             getWeekendPrice(car),
+
+    weekdayPrice: number(car.weekdayPrice ?? 0, 0),
 
           monthlyPrice:
             getMonthlyPrice(car),
@@ -1245,6 +1246,8 @@ function calculateCarAnalytics(
 
     weekendPrice:
       getWeekendPrice(car),
+
+    weekdayPrice: number(car.weekdayPrice ?? 0, 0),
 
     monthlyPrice:
       getMonthlyPrice(car),
@@ -2865,6 +2868,11 @@ monthlyPrice
 
 Never invent an exact current vehicle price when the data does not contain it.
 
+PRICE TIERS (very important): RYDO price tiers are 1-3 days = dailyPrice, 4-7 days, 8-25 days, and monthly. If weekdayPrice (Mon-Fri) / weekendPrice (Sat-Sun) are set, they can apply per day instead of the tier price (cars with smart pricing use the tier price with season/weekend adjustments).
+In the data, the field named price3to6 is the 4-7 DAY price and the field named price7to29 is the 8-25 DAY price.
+NEVER say "3-6 days" or "7-29 days" to the user. Say "4-7 days" and "8-25 days".
+If a tier price is 0 or missing, say that tier has no special price and the daily price applies.
+
 PROMOTIONS:
 
 When the user asks for a promotion plan, do not just give generic marketing advice.
@@ -2918,8 +2926,8 @@ Each plan MUST contain:
 - vehicle
 - plan name
 - daily price
-- 3-6 day price
-- 7-29 day price
+- 4-7 day price (JSON key price3to6)
+- 8-25 day price (JSON key price7to29)
 - weekend price when relevant
 - monthly price when relevant
 - discount percentage
