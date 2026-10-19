@@ -1,0 +1,13 @@
+RYDO AI SERVER - si ta vendosesh online (Render)
+================================================
+1) Vendose kete folder (server.js, package.json, package-lock.json) ne nje repo GitHub (private), p.sh. rydo-ai-server.
+2) render.com -> New -> Web Service -> zgjidh repo-n.
+   Runtime: Node | Build Command: npm install | Start Command: npm start
+3) Environment (Render -> Environment):
+   OPENAI_API_KEY = celesi yt i OpenAI   (VETEM ketu, kurre ne chat ose ne app)
+   OPENAI_MODEL   = modeli qe perdor (si ne .env te kompjuterit tend)
+   POCKETBASE_URL = https://tqd2jrifvbucreo.6j6t.pocketbasecloud.com
+   CORS_ORIGIN    = https://rydo-app.netlify.app
+4) Kur Render te jape adresen (https://emri.onrender.com), hap emri.onrender.com ne shfletues: duhet te pergjigjet serveri.
+5) Ma dergo adresen mua dhe e ndertoj web-in me te (EXPO_PUBLIC_RYDO_AI_URL).
+Shenim: pa pagese Render e fik serverin kur s'perdoret dhe i duhen ~30 sekonda te ngrihet.
