@@ -49,11 +49,146 @@ const OPENROUTER_KEY = String(
 const openrouter = new OpenAI({
   apiKey: OPENROUTER_KEY || 'missing',
   baseURL: 'https://openrouter.ai/api/v1',
+  maxRetries: 0,
+  timeout: Number(process.env.AI_MODEL_TIMEOUT_MS || 22000),
   defaultHeaders: {
     'HTTP-Referer': 'https://rydo-rent.expo.app',
     'X-Title': 'RYDO AI',
   },
 });
+
+/* RYDO-SPEED-GUIDE-V1 ---------------------------------------------------
+   Speed: short cache for PocketBase reads + login check, hard time limits per model.
+   Knowledge: full guide of the current RYDO system, sent with every answer.
+   Navigation: the AI can add up to 2 buttons that open the right screen.
+------------------------------------------------------------------------- */
+const __cache = new Map();
+const __inflight = new Map();
+function __cacheKey(parts) { return parts.join('|'); }
+async function cached(key, ttlMs, loader) {
+  const hit = __cache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.value;
+  if (__inflight.has(key)) return __inflight.get(key);
+  const p = (async () => {
+    try {
+      const value = await loader();
+      __cache.set(key, { value, exp: Date.now() + ttlMs });
+      if (__cache.size > 400) {
+        const now = Date.now();
+        for (const [k, v] of __cache) { if (v.exp < now) __cache.delete(k); }
+        if (__cache.size > 400) __cache.delete(__cache.keys().next().value);
+      }
+      return value;
+    } finally {
+      __inflight.delete(key);
+    }
+  })();
+  __inflight.set(key, p);
+  return p;
+}
+const DATA_CACHE_MS = Number(process.env.AI_DATA_CACHE_MS || 20000);
+const AUTH_CACHE_MS = Number(process.env.AI_AUTH_CACHE_MS || 60000);
+const MODEL_TIMEOUT_MS = Number(process.env.AI_MODEL_TIMEOUT_MS || 22000);
+
+/* Compact JSON for the model: no indentation, no empty values (fewer tokens = faster answer). */
+function compactJson(value) {
+  return JSON.stringify(value, (k, v) => {
+    if (v === null || v === undefined || v === '') return undefined;
+    if (Array.isArray(v) && v.length === 0) return undefined;
+    return v;
+  });
+}
+
+const NAV_ROUTES = {
+  all: {
+    '/cars': 1, '/my-bookings': 1, '/rydo-points': 1, '/convert-points': 1, '/wallet-add-money': 1,
+    '/transaction-history': 1, '/sos': 1, '/help-support': 1, '/support-chat': 1, '/favorites': 1,
+    '/availability-alerts': 1, '/referral-program': 1, '/profile': 1, '/verification': 1,
+    '/notifications': 1, '/payment-methods': 1, '/trust-center': 1, '/messages': 1, '/explore': 1,
+  },
+  owner: {
+    '/owner-dashboard': 1, '/owner-bookings': 1, '/owner-earnings': 1, '/earnings-estimator': 1,
+    '/owner-referral': 1, '/owner-fleet': 1, '/owner-calendar': 1, '/owner-promotions': 1,
+    '/owner-wallet': 1, '/list-your-car': 1, '/owner-analytics': 1, '/owner-settings': 1,
+    '/business-profile': 1, '/driver-requests': 1,
+  },
+  admin: {
+    '/admin': 1, '/admin-safety': 1, '/admin-disputes': 1, '/admin-payouts': 1, '/admin-support': 1, '/admin-reports': 1,
+  },
+};
+function allowedRoute(route, role) {
+  const base = String(route).split('?')[0];
+  if (NAV_ROUTES.all[base]) return true;
+  if ((role === 'owner' || role === 'business' || role === 'admin') && NAV_ROUTES.owner[base]) return true;
+  if (role === 'admin' && NAV_ROUTES.admin[base]) return true;
+  return false;
+}
+/* Takes [[go:/route|Label]] tags out of the answer and turns them into buttons. */
+function extractNavActions(content, role) {
+  const actions = [];
+  const clean = String(content || '').replace(/\[\[go:(\/[A-Za-z0-9\-_\/?=&.]{1,80})\|([^\]\n]{1,40})\]\]/g, (_m, route, label) => {
+    if (actions.length < 2 && allowedRoute(route, role) && !actions.some((a) => a.route === route)) {
+      actions.push({ id: 'go-' + (actions.length + 1), label: String(label).trim(), route });
+    }
+    return '';
+  }).replace(/\n{3,}/g, '\n\n').trim();
+  return { content: clean, actions };
+}
+
+const RYDO_GUIDE_GENERAL = String.raw`
+RYDO SYSTEM GUIDE (current app rules; if live data differs, trust the live data)
+
+PRICES AND BOOKING
+- Currency is EUR. Rental = days x daily rate. Price tiers: 1-3 days = daily price, 4-7 days = 4-7 day price, 8-25 days = 8-25 day price, long rentals can use the monthly price. Never say "3-6" or "7-29" days.
+- If the owner set weekday (Mon-Fri) / weekend (Sat-Sun) prices they apply per day; cars with Smart pricing follow season and weekend automatically.
+- Early-bird: owner can give a discount (max 30%) when the client books a set number of days ahead. Owner offers (percent off for a period) show in "Offers today".
+- The client pays only a deposit online = 20% of the total (never less than RYDO's own fees); the rest is paid to the owner at pick-up (cash or card) and the owner marks it received. Km plans, extra km, the extra-driver fee and trip extensions are paid to the owner at pick-up / end of trip and are not part of the RYDO total.
+- The owner has 24 hours to accept or decline. If nobody answers, the booking is cancelled and the deposit is refunded.
+- Minimum driver age is 21. Clients must verify identity and driving licence.
+- Extra driver: some cars charge a fee per extra driver (max 200 EUR, paid to the owner at pick-up).
+- Trip extension: the client asks for more days, the owner accepts or declines.
+- Km plans: the owner can offer km-per-day plans, a price per extra km and an optional tariff for driving outside Kosovo; the client can ask the owner for a custom km offer.
+- Delivery: same city = 2 EUR up to 2 km, then a per-km rate set by the admin (default 0.85 EUR/km); airport and other cities have fixed prices set by the admin; owners can also deliver free or agree directly with the client (no RYDO fee). The transport fee is split half owner, half RYDO. The airport is Prishtina International Airport.
+
+CANCELLATION (each car has one plan; it is copied into the booking)
+- Flexible: free until 24 h before pick-up; later the guest loses 1 day of rent.
+- Standard: free until 3 days before; from 3 days to 24 h before the guest loses 1 day; under 24 h or no-show loses 50%.
+- Strict: free within 24 h of booking if pick-up is 7+ days away; 7+ days before 50% refund; under 7 days no refund.
+- Trips of 2 days or less lose half a day instead of 1 day. The deposit and extras are always refunded. If the OWNER cancels, the guest gets 100% back.
+- "Non-refundable" option: if the owner allows it and the booking is made 4+ days before pick-up, the client gets a discount (default 10%, up to 30%); after the first hour the rental amount is not refunded (deposit and extras still are).
+
+MONEY, WALLET, POINTS
+- RYDO commission: 10% of the rental for private owners, 15% for approved Business profiles. Welcome offer: the first 10 partners pay 0% for 3 months. Owner-invites-owner: when the invited owner joins, BOTH get 30 commission-free days (screen: owner referral).
+- Clients can invite friends (referral program) and get a small wallet bonus.
+- Owner earnings = rental minus commission. Owners withdraw from the owner wallet (the server shows the exact minimum, usually 20 EUR).
+- Wallet: add money, pay with wallet + card. RYDO Points: 30 points = 1 EUR credit; 150 points convert to 5 EUR wallet credit.
+- Penalties for dealing outside RYDO are applied only by the admin (owner: from withdrawable money, client: from the wallet).
+- After a completed trip the client and the owner can open "Invoice (PDF)" on the booking card (My bookings / Owner bookings).
+
+OWNER TOOLS
+- Add a car, photos, prices, Smart pricing, cancellation plan, km plans, trip rules (min/max days, advance notice, buffer between trips, early-bird, extra-driver fee), plate/VIN, insurance and Green Card details + photos (the admin approves the papers), calendar and blocked days, promotions, earnings estimator, analytics, business profile.
+- Owner referral, owner wallet, owner bookings, deposits and contracts are separate screens.
+
+SAFETY AND TRUST
+- Contract with signature, vehicle handover record with photos, chat between client and owner, SOS screen (reports go to the admin safety panel), disputes (open a dispute on a booking), reviews with quick tag chips, blocked users, trust center, push notifications (tapping one opens the right screen).
+
+LIMITS
+- You cannot book, cancel, refund, change prices or approve anything yourself. Explain the steps and offer a button to the right screen.
+`;
+const RYDO_GUIDE_NAV = String.raw`
+BUTTONS: at the very end of an answer you may add up to 2 buttons, each on its own line, exactly like [[go:/my-bookings|Hap rezervimet]] (label in the user's language, max 4 words). Use only these routes:
+`;
+function systemGuideFor(role) {
+  const clientRoutes = Object.keys(NAV_ROUTES.all);
+  const ownerRoutes = Object.keys(NAV_ROUTES.owner);
+  const adminRoutes = Object.keys(NAV_ROUTES.admin);
+  let routes = clientRoutes;
+  if (role === 'owner' || role === 'business') routes = clientRoutes.concat(ownerRoutes);
+  if (role === 'admin') routes = clientRoutes.concat(ownerRoutes, adminRoutes);
+  return RYDO_GUIDE_GENERAL + RYDO_GUIDE_NAV + routes.join(' ') + '\n';
+}
+/* ---------------------------------------------------------------------- */
+
 
 /* =========================================================
    BASIC HELPERS
@@ -566,7 +701,7 @@ function getCarBookingState(
    POCKETBASE
 ========================================================= */
 
-async function getAuthenticatedUser(
+async function getAuthenticatedUserUncached(
   req,
 ) {
   const header = String(
@@ -646,7 +781,7 @@ async function getBusinessProfile(
   }
 }
 
-async function getBusinessStatus(
+async function getBusinessStatusUncached(
   pb,
   userId,
 ) {
@@ -660,6 +795,17 @@ async function getBusinessStatus(
     lower(profile?.status) ===
     'approved'
   );
+}
+
+async function getAuthenticatedUser(req) {
+  const header = String(req.headers.authorization || '');
+  const token = header.toLowerCase().startsWith('bearer ') ? header.slice(7).trim() : '';
+  if (!token) return getAuthenticatedUserUncached(req);
+  return cached(__cacheKey(['auth', token.slice(-40)]), AUTH_CACHE_MS, () => getAuthenticatedUserUncached(req));
+}
+
+async function getBusinessStatus(pb, userId) {
+  return cached(__cacheKey(['biz', String(userId)]), AUTH_CACHE_MS, () => getBusinessStatusUncached(pb, userId));
 }
 
 function resolveRole(
@@ -688,7 +834,7 @@ function resolveRole(
   return 'client';
 }
 
-async function listSafe(
+async function listSafeUncached(
   pb,
   collection,
   options = {},
@@ -734,6 +880,14 @@ async function listSafe(
         'PocketBase collection unavailable',
     };
   }
+}
+
+async function listSafe(pb, collection, options = {}) {
+  const who = String(pb?.authStore?.token || '').slice(-24);
+  const key = __cacheKey(['list', who, collection, options.filter || '', options.sort || '', options.batch || '']);
+  const r = await cached(key, DATA_CACHE_MS, () => listSafeUncached(pb, collection, options));
+  if (r && r.error) __cache.delete(key); // never keep an error
+  return { items: Array.isArray(r?.items) ? r.items.slice() : [], error: r?.error || null };
 }
 
 /* =========================================================
@@ -2137,8 +2291,7 @@ async function buildContext(
   ]);
 
   const common = {
-    platform:
-      getRydoPlatformKnowledge(),
+    
 
     generatedAt:
       new Date().toISOString(),
@@ -3784,20 +3937,13 @@ Business approved: ${businessApproved}
 
 CURRENT LIVE RYDO CONTEXT
 
-${JSON.stringify(
-  context,
-  null,
-  2,
-)}
+${compactJson(context)}
 `;
 
       const messages = [
         {
           role: 'system',
-          content:
-            instructionsFor(
-              role,
-            ),
+          content: instructionsFor(role) + systemGuideFor(role),
         },
 
         {
@@ -3834,7 +3980,7 @@ ${JSON.stringify(
                 model: candidateModel,
                 messages,
                 temperature: 0.2,
-                max_tokens: 2200,
+                max_tokens: 1500,
               },
             );
 
@@ -4023,9 +4169,10 @@ ${JSON.stringify(
           : 'none',
       );
 
+      const __nav = extractNavActions(finalContent, role);
       return res.json({
-        content:
-          finalContent,
+        content: __nav.content,
+        actions: __nav.actions,
 
         recommendation:
           recommendationResponse.recommendation,
