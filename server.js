@@ -57,6 +57,64 @@ const openrouter = new OpenAI({
   },
 });
 
+/* RYDO-SPEED-V2 ----------------------------------------------------------
+   1) Race the first two models: the first real answer wins, the other is cancelled.
+   2) Answer cache: the same question from the same user is answered instantly.
+   3) Light mode: general "how does RYDO work" questions skip the heavy live data
+      (the guide already contains the rules), so they answer much faster.
+------------------------------------------------------------------------- */
+const ANSWER_CACHE_LIGHT_MS = Number(process.env.AI_ANSWER_CACHE_MS || 600000);
+const ANSWER_CACHE_FULL_MS = 15000;
+const AI_RACE = String(process.env.AI_RACE ?? '1') !== '0';
+const __answers = new Map();
+function foldText(s) {
+  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+function answerCacheGet(key) {
+  const hit = __answers.get(key);
+  if (hit && hit.exp > Date.now()) return hit.body;
+  if (hit) __answers.delete(key);
+  return null;
+}
+function answerCachePut(key, body, ttl) {
+  __answers.set(key, { body, exp: Date.now() + ttl });
+  if (__answers.size > 300) __answers.delete(__answers.keys().next().value);
+}
+const HOWTO_RE = /(si funksionon|si funksionojne|si behet|si ta |si te |si e |cfare eshte|cka eshte|cka jane|cfare jane|what is|what are|how (does|do|can|to)|where (do|can)|ku (e|ta|te) |a lejohet|is it allowed|politika|rregull|policy|rules?)/;
+const LIVE_RE = /\b(imi|ime|time|tim|jam|kam|dua|rezervim\w*|booking\w*|portofol\w*|wallet|balanc\w*|makin\w*|vetur\w*|cars?|disponues\w*|available|rekomando|sygjero|recommend|suggest|promov\w*|fitim\w*|earn\w*|revenue|cmim\w*|price\w*|buxhet\w*|budget|sot|today|neser|tomorrow|data|date|dite|days?|verifik\w*|status\w*|pse|why|problem\w*|error|gabim\w*|nuk|paguaj|pay)\b/;
+function isGeneralQuestion(message) {
+  const t = foldText(message);
+  if (!t || t.length > 140) return false;
+  if (typeof isPromotionIntent === 'function' && isPromotionIntent(message)) return false;
+  return HOWTO_RE.test(t) && !LIVE_RE.test(t);
+}
+async function raceModels(models, messages, issues) {
+  if (!AI_RACE || models.length < 2) return null;
+  const pair = models.slice(0, 2);
+  const ctrls = pair.map(() => new AbortController());
+  try {
+    const winner = await Promise.any(pair.map(async (m, i) => {
+      try {
+        const completion = await openrouter.chat.completions.create(
+          { model: m, messages, temperature: 0.2, max_tokens: 1500 },
+          { signal: ctrls[i].signal },
+        );
+        const c = extractOpenRouterContent(completion);
+        if (!c) { issues.push(m + ': empty answer'); throw new Error('empty'); }
+        return { content: c, model: m, i };
+      } catch (e) {
+        if (e && e.message !== 'empty') issues.push(m + ': ' + String(e.message || e).slice(0, 160));
+        throw e;
+      }
+    }));
+    ctrls.forEach((c, i) => { if (i !== winner.i) c.abort(); });
+    return winner;
+  } catch (e) {
+    return null;
+  }
+}
+/* ---------------------------------------------------------------------- */
+
 /* RYDO-SPEED-GUIDE-V1 ---------------------------------------------------
    Speed: short cache for PocketBase reads + login check, hard time limits per model.
    Knowledge: full guide of the current RYDO system, sent with every answer.
@@ -3915,13 +3973,34 @@ app.post(
         `RYDO AI request: user=${user.id} role=${role}`,
       );
 
-      const context =
-        await buildContext(
-          pb,
-          user,
-          role,
-          businessApproved,
-        );
+      const __light = isGeneralQuestion(message);
+      const __ansKey = __cacheKey([
+        'ans',
+        String(pb?.authStore?.token || '').slice(-24),
+        role,
+        foldText(message),
+        foldText(String((Array.isArray(req.body?.history) ? req.body.history.slice(-1)[0]?.content : '') || '').slice(0, 80)),
+      ]);
+      const __hit = answerCacheGet(__ansKey);
+      if (__hit) {
+        console.log('RYDO AI answer from cache');
+        return res.json(__hit);
+      }
+      const __origJson = res.json.bind(res);
+      res.json = (body) => {
+        if (body && body.content && !body.fallback && res.statusCode < 400) {
+          answerCachePut(__ansKey, body, __light ? ANSWER_CACHE_LIGHT_MS : ANSWER_CACHE_FULL_MS);
+        }
+        return __origJson(body);
+      };
+
+      const context = __light
+        ? {
+            authenticatedRole: role,
+            businessApproved,
+            note: 'General how-it-works question: live data was not loaded to answer faster. Answer from the RYDO SYSTEM GUIDE. If the user needs THEIR OWN data (bookings, wallet, cars, earnings), tell them to ask it directly.',
+          }
+        : await buildContext(pb, user, role, businessApproved);
 
       const history =
         cleanHistory(
@@ -3972,7 +4051,14 @@ ${compactJson(context)}
         ),
       ].slice(0, 4);
 
-      for (const candidateModel of modelsToTry) {
+      const __raceTried = AI_RACE && modelsToTry.length >= 2;
+      const __race = await raceModels(modelsToTry, messages, providerIssues);
+      if (__race) {
+        content = __race.content;
+        usedModel = __race.model;
+      }
+
+      for (const candidateModel of (content ? [] : modelsToTry.slice(__raceTried ? 2 : 0))) {
         try {
           const completion =
             await openrouter.chat.completions.create(
