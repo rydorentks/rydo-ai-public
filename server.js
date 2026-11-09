@@ -3,7 +3,6 @@ import dotenv from 'dotenv';
 import express from 'express';
 import OpenAI from 'openai';
 import PocketBase from 'pocketbase';
-import { mountTravelAI } from './travelModule.js'; // RYDO-TRIP
 
 dotenv.config({
   path: new URL('./.env', import.meta.url),
@@ -4447,23 +4446,6 @@ app.post(
     }
   },
 );
-
-/* =========================================================
-   RYDO TRAVEL AI - independent module   // RYDO-TRIP
-   Does nothing unless TRAVEL_AI_ENABLED=true (off by default: this
-   server then behaves exactly as before). It has its own API key, model
-   and routes (POST /v1/ai/trip, GET /v1/ai/trip/health) in travelModule.js
-   and never uses the Rent AI key or models. Only the login check is shared.
-========================================================= */
-
-mountTravelAI({
-  app,
-  OpenAI,
-  env: process.env,
-  pbUrl: PB_URL,
-  getAuthenticatedUser,
-  extractContent: extractOpenRouterContent,
-});
 
 /* =========================================================
    SERVER
