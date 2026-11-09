@@ -17,9 +17,15 @@ import {
 
 /* ------------------------------------------------------------------ switch and client */
 
-/** The Travel trip endpoint exists ONLY when TRAVEL_AI_ENABLED is true/1/yes/on. Anything else (or nothing) = off. */
+/**
+ * The Travel trip endpoint exists ONLY when TRAVEL_AI_ENABLED is true/1/yes/on. Anything else (or nothing) = off.
+ * Forgiving about how the value was typed in a dashboard: quotes, spaces, invisible characters and a pasted
+ * "TRAVEL_AI_ENABLED=true" are all read as true. A wrong word (e.g. "enabled", "tru") is still off.
+ */
 export function isTripEnabled(env = {}) {
-  return ['true', '1', 'yes', 'on'].includes(String(env.TRAVEL_AI_ENABLED || '').trim().toLowerCase());
+  const cleaned = String(env.TRAVEL_AI_ENABLED ?? '').toLowerCase().replace(/[^a-z0-9=]/g, '');
+  const value = cleaned.includes('=') ? cleaned.split('=').pop() : cleaned;
+  return ['true', '1', 'yes', 'on'].includes(value);
 }
 
 export const cleanKey = (v) => String(v || '').replace(/^\s*OPENROUTER_TRIP_API_KEY\s*=\s*/i, '').replace(/["'\s]/g, '');

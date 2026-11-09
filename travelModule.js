@@ -38,7 +38,11 @@ export function readTravelConfig(env = {}) {
  */
 export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthenticatedUser, extractContent, logger = console, makeClient }) {
   const config = readTravelConfig(env);
-  if (!config.enabled) return { mounted: false, configured: false, problems: [] };
+  if (!config.enabled) {
+    const raw = env.TRAVEL_AI_ENABLED;
+    logger.log(`RYDO Travel AI: OFF. TRAVEL_AI_ENABLED is ${raw === undefined ? 'not set' : `${JSON.stringify(String(raw))} (length ${String(raw).length})`}; it must be true to turn Travel on. Rent AI is not affected.`);
+    return { mounted: false, configured: false, problems: [] };
+  }
 
   const configured = config.problems.length === 0 && Boolean(pbUrl);
   const problems = [...config.problems, ...(pbUrl ? [] : ['POCKETBASE_URL is missing'])];
@@ -64,6 +68,9 @@ export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthen
     );
   }
 
+  logger.log(configured
+    ? 'RYDO Travel AI: ON (POST /v1/ai/trip, GET /v1/ai/trip/health; own key and model).'
+    : 'RYDO Travel AI: ON but not configured (see GET /v1/ai/trip/health).');
   // Configuration status only. No secrets, no model names, no call to OpenRouter (so it costs nothing).
   app.get('/v1/ai/trip/health', (_req, res) =>
     res.status(configured ? 200 : 503).json({
