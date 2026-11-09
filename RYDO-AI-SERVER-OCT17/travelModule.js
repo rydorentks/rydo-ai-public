@@ -13,6 +13,8 @@
  */
 import { createTripLimiter, splitModels } from './trip.js';
 import { cleanKey, createTripHandler, createUsageStore, isTripEnabled } from './tripRoute.js';
+import { createFetchJson, isCompanionEnabled } from './companion.js';
+import { companionLimiter, createCompanionHandler, createSuggestHandler, suggestLimiter } from './companionRoute.js';
 
 /** Reads the Travel settings from the environment. Never throws. `problems` lists what is missing. */
 export function readTravelConfig(env = {}) {
@@ -36,7 +38,7 @@ export function readTravelConfig(env = {}) {
  * Adds the Travel routes to `app`. Does nothing at all when TRAVEL_AI_ENABLED is not true.
  * Returns { mounted, configured, problems } (used by tests and the startup log).
  */
-export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthenticatedUser, extractContent, logger = console, makeClient }) {
+export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthenticatedUser, extractContent, logger = console, makeClient, fetchJson }) {
   const config = readTravelConfig(env);
   if (!config.enabled) {
     const raw = env.TRAVEL_AI_ENABLED;
@@ -44,6 +46,7 @@ export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthen
     return { mounted: false, configured: false, problems: [] };
   }
 
+  let companion = false;
   const configured = config.problems.length === 0 && Boolean(pbUrl);
   const problems = [...config.problems, ...(pbUrl ? [] : ['POCKETBASE_URL is missing'])];
 
@@ -66,6 +69,31 @@ export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthen
         logger,
       }),
     );
+    // Travel Companion + AI experience suggestions: own switch (TRAVEL_COMPANION_ENABLED), off by default. Same Travel key and models.
+    // They write to the same usage table with their own `kind`, so the trip limit and these limits never mix.
+    if (isCompanionEnabled(env)) {
+      const shared = {
+        openrouter: client,
+        openrouterKey: config.key,
+        pbUrl,
+        getAuthenticatedUser,
+        extractContent,
+        models: { primary: config.model, extra: config.fallbacks, free: [] },
+        logger,
+      };
+      app.post('/v1/ai/companion', createCompanionHandler({
+        ...shared,
+        limiter: companionLimiter(),
+        usageStore: config.usageCollection ? createUsageStore({ collection: config.usageCollection, kind: 'companion' }) : null,
+        fetchJson: fetchJson || createFetchJson(),
+      }));
+      app.post('/v1/ai/suggest', createSuggestHandler({
+        ...shared,
+        limiter: suggestLimiter(),
+        usageStore: config.usageCollection ? createUsageStore({ collection: config.usageCollection, kind: 'suggest' }) : null,
+      }));
+      companion = true;
+    }
   }
 
   logger.log(configured
@@ -78,9 +106,10 @@ export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthen
       service: 'rydo-travel-ai',
       configured,
       persistentLimit: Boolean(config.usageCollection),
+      companion,
       fallbackModels: config.fallbacks.length,
       ...(configured ? {} : { problems }),
     }),
   );
-  return { mounted: true, configured, problems };
+  return { mounted: true, configured, companion, problems };
 }
