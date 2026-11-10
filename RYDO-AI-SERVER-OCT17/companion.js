@@ -8,6 +8,10 @@
  *     every limitation ("live data was not available") is added by the SERVER, so it is honest even if the AI forgets it.
  */
 import { TripError, cleanText, cleanNumber, cleanTime, cleanHistory } from './trip.js';
+import { cleanCoord, distanceMeters, mapLink } from './geo.js';
+import { compareRanked, experienceInfo, ratingScore } from './sponsor.js';
+
+export { distanceMeters, mapLink };
 
 export const COMPANION_LIMITS = Object.freeze({
   maxMessageChars: 500,
@@ -50,11 +54,6 @@ export const safeText = (v, max) => stripLinks(cleanText(v, max + 200)).slice(0,
 
 /* ------------------------------------------------------------------ request */
 
-function cleanCoord(v, min, max) {
-  const n = typeof v === 'string' ? Number(v) : v;
-  if (typeof n !== 'number' || !Number.isFinite(n) || n < min || n > max) return null;
-  return Math.round(n * 10000) / 10000; // ~11 m. We never need more, and we do not keep exact positions around.
-}
 
 /** A trip summary sent by the app. It is the traveller's own data but it is still only trimmed text for the prompt. */
 export function cleanTripContext(raw, today = new Date().toISOString().slice(0, 10)) {
@@ -192,24 +191,12 @@ export function buildPlacesQuery(lat, lng, radius = COMPANION_LIMITS.radiusMeter
   return `[out:json][timeout:12];(${parts});out center 80;`;
 }
 
-const toRad = (d) => (d * Math.PI) / 180;
-export function distanceMeters(a, b) {
-  const R = 6371000;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-  return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(h))));
-}
-
 const groupOf = (tags) => {
   if (tags.amenity === 'restaurant' || tags.amenity === 'cafe') return 'food';
   if (tags.tourism || tags.historic) return 'sights';
   return 'nature';
 };
 const labelOf = (tags) => cleanText(tags.amenity || tags.tourism || tags.historic || tags.leisure || tags.natural || 'place', 30).replace(/_/g, ' ');
-
-/** Google Maps directions link, built by US from the coordinates. The AI never writes links. */
-export const mapLink = (lat, lng) => `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
 
 /** Overpass answer -> up to `max` real, named places, nearest first, a few from each group. */
 export function parsePlaces(raw, center, max = COMPANION_LIMITS.maxPlaces) {
@@ -417,15 +404,16 @@ export function buildSuggestMessages({ city, interests, message, language, exper
 }
 
 /** PocketBase records -> numbered, trimmed experiences. Only approved ones, and only with a title. */
-export function prepareExperiences(records, city = '') {
+export function prepareExperiences(records, city = '', { stats = null, today = new Date().toISOString().slice(0, 10), pbUrl = '' } = {}) {
   const want = String(city || '').trim().toLowerCase();
   const rows = [];
   for (const r of Array.isArray(records) ? records : []) {
     if (!isObj(r) || String(r.status) !== 'approved') continue;
     const title = cleanText(r.title, 100);
     if (!title) continue;
+    const id = cleanText(r.id, 40);
     rows.push({
-      id: cleanText(r.id, 40),
+      id,
       title,
       category: cleanText(r.category, 20),
       city: cleanText(r.city, 60),
@@ -436,16 +424,30 @@ export function prepareExperiences(records, city = '') {
       partnerName: cleanText(r.partnerName, 80),
       hasLink: /^https:\/\//i.test(String(r.bookingUrl || '')),
       cityMatch: want ? String(r.city || '').trim().toLowerCase() === want : false,
+      order: rows.length,
+      ...experienceInfo(r, stats instanceof Map ? stats.get(id) : undefined, { today, pbUrl }),
     });
   }
-  // City matches first (so they survive the cut), then the rest.
-  rows.sort((a, b) => Number(b.cityMatch) - Number(a.cityMatch));
+  // City matches first (so they survive the cut), then sponsored businesses, then better rated, then more people who opened it,
+  // then the database order (newest first). Without any stats this keeps the old order.
+  rows.sort((a, b) => Number(b.cityMatch) - Number(a.cityMatch) || compareRanked({ ...a, title: '' }, { ...b, title: '' }) || a.order - b.order);
   return rows.slice(0, COMPANION_LIMITS.maxExperiences).map((e, i) => ({ ref: `E${i + 1}`, ...e }));
 }
 
 const publicExperience = (e, why) => ({
   id: e.id, title: e.title, category: e.category, city: e.city, country: e.country, priceFrom: e.priceFrom, currency: e.currency, partnerName: e.partnerName, why,
+  // From the database and the admin's stats, never from the AI. "sponsored" is only true while the admin has switched it on.
+  sponsored: !!e.sponsored, ratingAvg: e.ratingAvg || 0, ratingCount: e.ratingCount || 0, referrals: e.referrals || 0, photoUrl: e.photoUrl || '', hasVideo: !!e.hasVideo,
 });
+
+/** Sponsored businesses first (best rated first among them); everything else keeps the order it was in (the AI's best match first). */
+export function sponsoredFirst(picks) {
+  const score = (p) => ratingScore(p.ratingAvg, p.ratingCount);
+  return picks
+    .map((p, i) => ({ p, i }))
+    .sort((a, b) => Number(!!b.p.sponsored) - Number(!!a.p.sponsored) || (a.p.sponsored && b.p.sponsored ? score(b.p) - score(a.p) || b.p.referrals - a.p.referrals : 0) || a.i - b.i)
+    .map((x) => x.p);
+}
 
 /** Rebuilds the suggestions. Everything except `why` comes from the database row, never from the AI. */
 export function validateSuggestResponse(parsed, experiences) {
@@ -460,7 +462,7 @@ export function validateSuggestResponse(parsed, experiences) {
     seen.add(ref);
     picks.push(publicExperience(e, safeText(raw?.why, COMPANION_LIMITS.maxWhyChars)));
   }
-  return { type: 'suggestions', picks, note: safeText(parsed.note, 200), source: 'ai' };
+  return { type: 'suggestions', picks: sponsoredFirst(picks), note: safeText(parsed.note, 200), source: 'ai' };
 }
 
 /** When the AI is not available we still help: approved offers in the same city, no AI reasons. Clearly marked. */
@@ -469,7 +471,7 @@ export function fallbackSuggestions(experiences, { city }) {
   const pool = want ? experiences.filter((e) => e.city.toLowerCase() === want) : experiences;
   return {
     type: 'suggestions',
-    picks: pool.slice(0, COMPANION_LIMITS.maxPicks).map((e) => publicExperience(e, '')),
+    picks: sponsoredFirst(pool.slice(0, COMPANION_LIMITS.maxPicks).map((e) => publicExperience(e, ''))),
     note: 'The AI is busy, so this is a simple list of approved offers' + (want ? ' in this city.' : '.'),
     source: 'list',
   };

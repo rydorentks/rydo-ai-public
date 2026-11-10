@@ -17,6 +17,7 @@ import {
   validateCompanionResponse,
   validateSuggestResponse,
 } from './companion.js';
+import { preparePartners, statsMap } from './sponsor.js';
 
 export const companionLimiter = () => createTripLimiter({ perMinute: COMPANION_LIMITS.perMinute, perDay: COMPANION_LIMITS.perDay });
 export const suggestLimiter = () => createTripLimiter({ perMinute: COMPANION_LIMITS.suggestPerMinute, perDay: COMPANION_LIMITS.suggestPerDay });
@@ -45,6 +46,28 @@ async function askModels({ openrouter, sequence, messages, extractContent, build
     }
   }
   return { result: null, issues };
+}
+
+/** Approved businesses + the admin's stats, read with the traveller's own session (PocketBase rules decide what is visible). Never throws. */
+async function readSponsorData(pb, { geoOnly = false, logger }) {
+  let records = [];
+  let ok = true;
+  try {
+    const page = await pb.collection('travel_experiences').getList(1, 200, { filter: geoOnly ? 'status = "approved" && lat != 0' : 'status = "approved"', sort: '-created' });
+    records = page?.items || [];
+  } catch (e) {
+    ok = false;
+    logger.warn('RYDO AI: could not read experiences:', e?.message || e);
+  }
+  let stats = new Map();
+  try {
+    const page = await pb.collection('travel_experience_stats').getList(1, 500);
+    stats = statsMap(page?.items || []);
+  } catch (e) {
+    // Stats are optional: without them nobody is "sponsored" and nobody has stars. The list still works.
+    logger.warn('RYDO AI: stats not available (no sponsors, no stars shown):', e?.message || e);
+  }
+  return { records, stats, ok };
 }
 
 /** Shared start of both handlers: login, request parsing, limits. Returns { pb, userId, input } or sends the error and returns null. */
@@ -102,13 +125,16 @@ export function createCompanionHandler({
     try {
       const start = await begin({ req, res, parse: parseCompanionRequest, limiter, usageStore, usageLimits: { perMinute: COMPANION_LIMITS.perMinute, perDay: COMPANION_LIMITS.perDay }, getAuthenticatedUser, logger, openrouterKey, pbUrl, what: 'Travel Companion questions' });
       if (!start) return undefined;
-      const { userId, input } = start;
+      const { pb, userId, input } = start;
 
       // Live data first. It never throws: a missing source becomes a limitation that the server adds to the answer.
       const facts = await gatherLiveFacts({ location: input.location, trip: input.trip }, fetchJson);
       const today = new Date(now()).toISOString().slice(0, 10);
       const messages = buildCompanionMessages({ message: input.message, history: input.history, language: input.language, trip: input.trip, facts, today });
       const sequence = buildModelSequence({ ...models, max: maxAttempts });
+
+      // Partner businesses near the same reference point, read while the AI thinks. Listed by the server, never chosen or described by the AI.
+      const partnersJob = facts.center ? readSponsorData(pb, { geoOnly: true, logger }) : Promise.resolve(null);
 
       const { result, issues } = await askModels({
         openrouter, sequence, messages, extractContent, attemptTimeoutMs, totalTimeoutMs, now,
@@ -118,8 +144,14 @@ export function createCompanionHandler({
         logger.error('RYDO AI companion failed:', issues.join(' | '));
         return res.status(502).json({ error: 'Your Travel Companion could not answer right now. Please try again.' });
       }
+      const sponsorData = await partnersJob;
+      result.partners = sponsorData ? preparePartners(sponsorData.records, sponsorData.stats, facts.center, { today, pbUrl }) : [];
+      result.partnersNote = result.partners.some((p) => p.sponsored)
+        ? 'Businesses marked "Sponsored" paid RYDO to be shown first. Stars come from travellers who opened the business through RYDO.'
+        : '';
+      if (sponsorData && !sponsorData.ok) result.limitations = [...result.limitations, 'Partner businesses are not available right now.'].slice(0, 6);
       // Not logged: the question text, the position. Only who, what kind and which model.
-      logger.log(`RYDO AI companion: user=${userId} location=${facts.centerSource} places=${facts.places.length} model=${result.model}`);
+      logger.log(`RYDO AI companion: user=${userId} location=${facts.centerSource} places=${facts.places.length} partners=${result.partners.length} model=${result.model}`);
       return res.json(result);
     } catch (error) {
       logger.error('RYDO AI companion error:', error?.message || error);
@@ -141,15 +173,10 @@ export function createSuggestHandler({
       const { pb, userId, input } = start;
 
       // Real approved offers only. Read with the traveller's own session, so PocketBase's rules decide what is visible.
-      let records = [];
-      try {
-        const page = await pb.collection('travel_experiences').getList(1, 200, { filter: 'status = "approved"', sort: '-created' });
-        records = page?.items || [];
-      } catch (e) {
-        logger.warn('RYDO AI suggest: could not read experiences:', e?.message || e);
-        return res.status(503).json({ error: 'Local experiences are not available right now. Please try again later.' });
-      }
-      const experiences = prepareExperiences(records, input.city);
+      const { records, stats, ok } = await readSponsorData(pb, { logger });
+      if (!ok) return res.status(503).json({ error: 'Local experiences are not available right now. Please try again later.' });
+      const today = new Date(now()).toISOString().slice(0, 10);
+      const experiences = prepareExperiences(records, input.city, { stats, today, pbUrl });
       // Nothing to choose from: answer at once, no AI call, no cost.
       if (!experiences.length) return res.json({ type: 'suggestions', picks: [], note: 'There are no approved local experiences yet.', source: 'none' });
 
