@@ -99,7 +99,28 @@ export function parseCompanionRequest(body) {
     // The app only sends a position after the person allowed it. If one of the two numbers is bad we use neither.
     location: lat !== null && lng !== null ? { lat, lng } : null,
     trip: cleanTripContext(body.trip),
+    // RYDO-COMPANION-CLIENT-PLACES: places the app looked up itself (the free map servers often refuse our cloud server).
+    clientPlaces: cleanClientPlaces(body.places),
+    placesCenter: cleanCoord(body.placesCenter?.lat, -90, 90) !== null && cleanCoord(body.placesCenter?.lng, -180, 180) !== null
+      ? { lat: cleanCoord(body.placesCenter.lat, -90, 90), lng: cleanCoord(body.placesCenter.lng, -180, 180) }
+      : null,
   };
+}
+
+/** Places sent by the app: only named places of the kinds we list, with real coordinates. Anything else is dropped. */
+export function cleanClientPlaces(raw) {
+  const out = [];
+  for (const p of Array.isArray(raw) ? raw.slice(0, 80) : []) {
+    if (!isObj(p)) continue;
+    const key = String(p.key || '');
+    const value = String(p.value || '');
+    const name = cleanText(p.name, 80);
+    const lat = cleanCoord(p.lat, -90, 90);
+    const lng = cleanCoord(p.lng, -180, 180);
+    if (!name || lat === null || lng === null || !PHOTON_ALLOWED[key] || !PHOTON_ALLOWED[key].test(value)) continue;
+    out.push({ lat, lon: lng, tags: { [key]: value, name } });
+  }
+  return out;
 }
 
 /** Request for the experience suggestions. */
@@ -303,7 +324,7 @@ export function parsePlaces(raw, center, max = COMPANION_LIMITS.maxPlaces) {
  * Collects the live facts for one question. Every source is optional and has its own timeout; a failure only adds a limitation.
  * Returns { center, centerSource, weather, places, limitations }.
  */
-export async function gatherLiveFacts({ location, trip, message = '' }, fetchJson, { timeoutMs = 9000 } = {}) {
+export async function gatherLiveFacts({ location, trip, message = '', clientPlaces = [], placesCenter = null }, fetchJson, { timeoutMs = 9000 } = {}) {
   const limitations = [];
   let center = null;
   let centerSource = 'none';
@@ -319,6 +340,12 @@ export async function gatherLiveFacts({ location, trip, message = '' }, fetchJso
         centerName = g.name || asked.name;
       }
     } catch { /* fall back to the location or the trip below */ }
+    if (!center && placesCenter && clientPlaces.length) {
+      // Our server could not look the city up, but the app did.
+      center = { lat: placesCenter.lat, lng: placesCenter.lng };
+      centerSource = 'message';
+      centerName = asked.name;
+    }
   }
   if (center) {
     /* the city from the question */
@@ -375,6 +402,11 @@ export async function gatherLiveFacts({ location, trip, message = '' }, fetchJso
     return fromPhoton;
   };
   const askPlaces = async () => {
+    // Places from the app come first when there are enough of them near the point: no wait for the free map servers.
+    if (clientPlaces.length) {
+      const near = { elements: clientPlaces.filter((e) => distanceMeters(center, { lat: e.lat, lng: e.lon }) <= COMPANION_LIMITS.radiusMeters * 1.5) };
+      if (parsePlaces(near, center).length >= 5) return near;
+    }
     const hit = PLACES_CACHE.get(cacheKey);
     if (hit && Date.now() - hit.at < PLACES_CACHE_MS) return hit.raw;
     const raw = await fetchPlaces();
