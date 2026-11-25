@@ -18,6 +18,7 @@ import {
   validateSuggestResponse,
 } from './companion.js';
 import { preparePartners, statsMap } from './sponsor.js';
+import { clientIp } from './tripRoute.js';
 
 export const companionLimiter = () => createTripLimiter({ perMinute: COMPANION_LIMITS.perMinute, perDay: COMPANION_LIMITS.perDay });
 export const suggestLimiter = () => createTripLimiter({ perMinute: COMPANION_LIMITS.suggestPerMinute, perDay: COMPANION_LIMITS.suggestPerDay });
@@ -71,11 +72,36 @@ async function readSponsorData(pb, { geoOnly = false, logger }) {
 }
 
 /** Shared start of both handlers: login, request parsing, limits. Returns { pb, userId, input } or sends the error and returns null. */
-async function begin({ req, res, parse, limiter, usageStore, usageLimits, getAuthenticatedUser, logger, openrouterKey, pbUrl, what }) {
+async function begin({ req, res, parse, limiter, usageStore, usageLimits, getAuthenticatedUser, logger, openrouterKey, pbUrl, what, guest = null }) {
   if (!openrouterKey) { res.status(503).json({ error: 'RYDO AI server has no Travel AI key configured.' }); return null; }
   if (!pbUrl) { res.status(503).json({ error: 'RYDO AI server has no POCKETBASE_URL configured.' }); return null; }
   let pb;
   let user;
+  // RYDO-TRIP-GUEST: no session at all = a visitor with a small daily allowance (when `guest` is given). A bad token still answers 401.
+  const hasAuth = /^bearer\s+\S+/i.test(String(req?.headers?.authorization || ''));
+  if (!hasAuth && guest) {
+    let input0;
+    try {
+      input0 = parse(req.body);
+    } catch (e) {
+      if (e instanceof TripError) { res.status(e.status).json({ error: e.message }); return null; }
+      throw e;
+    }
+    const ip = clientIp(req);
+    const g = guest.limiter.check(ip);
+    if (!g.ok) {
+      res.set('Retry-After', String(g.retryAfter));
+      res.status(429).json({ error: 'You used your free questions for today. Sign in to ask more.', code: 'guest_limit', retryAfter: g.retryAfter });
+      return null;
+    }
+    try {
+      pb = guest.makePb();
+    } catch {
+      res.status(503).json({ error: 'Something went wrong. Please try again.' });
+      return null;
+    }
+    return { pb, userId: 'guest', input: input0 };
+  }
   try {
     ({ pb, user } = await getAuthenticatedUser(req));
   } catch {
@@ -120,15 +146,16 @@ async function begin({ req, res, parse, limiter, usageStore, usageLimits, getAut
 export function createCompanionHandler({
   openrouter, openrouterKey, pbUrl, getAuthenticatedUser, extractContent, models, limiter, usageStore = null, fetchJson,
   maxAttempts = 3, attemptTimeoutMs = 30000, totalTimeoutMs = 60000, now = () => Date.now(), logger = console,
+  guest = null, // RYDO-TRIP-GUEST: { limiter, makePb } -> a few free questions a day without an account
 }) {
   return async function companionHandler(req, res) {
     try {
-      const start = await begin({ req, res, parse: parseCompanionRequest, limiter, usageStore, usageLimits: { perMinute: COMPANION_LIMITS.perMinute, perDay: COMPANION_LIMITS.perDay }, getAuthenticatedUser, logger, openrouterKey, pbUrl, what: 'Travel Companion questions' });
+      const start = await begin({ req, res, parse: parseCompanionRequest, limiter, usageStore, usageLimits: { perMinute: COMPANION_LIMITS.perMinute, perDay: COMPANION_LIMITS.perDay }, getAuthenticatedUser, logger, openrouterKey, pbUrl, what: 'Travel Companion questions', guest });
       if (!start) return undefined;
       const { pb, userId, input } = start;
 
       // Live data first. It never throws: a missing source becomes a limitation that the server adds to the answer.
-      const facts = await gatherLiveFacts({ location: input.location, trip: input.trip }, fetchJson);
+      const facts = await gatherLiveFacts({ location: input.location, trip: input.trip, message: input.message }, fetchJson);
       const today = new Date(now()).toISOString().slice(0, 10);
       const messages = buildCompanionMessages({ message: input.message, history: input.history, language: input.language, trip: input.trip, facts, today });
       const sequence = buildModelSequence({ ...models, max: maxAttempts });
