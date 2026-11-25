@@ -209,6 +209,14 @@ export const CITY_STEMS = Object.freeze([
   ['athin', 'Athens', 'GR'], ['athens', 'Athens', 'GR'], ['selanik', 'Thessaloniki', 'GR'], ['thessalonik', 'Thessaloniki', 'GR'], ['sofj', 'Sofia', 'BG'], ['sofia', 'Sofia', 'BG'], ['ljubljan', 'Ljubljana', 'SI'],
 ]);
 
+const FOOD_STEMS = ['ha', 'ham', 'hame', 'hane', 'hang', 'hong', 'ngren', 'ushqim', 'restor', 'qebap', 'pizz', 'burek', 'mengjes', 'drek', 'dark', 'mesn', 'mish', 'gatim',
+  'food', 'eat', 'lunch', 'dinner', 'breakfast', 'restaurant', 'essen', 'manger', 'mangiare', 'comer', 'cibo'];
+/** True when the question is about eating ("ku të ha", "diçka për drekë", "where to eat"). */
+export function isFoodQuestion(text) {
+  const words = plain(text).replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(Boolean);
+  return words.some((w) => FOOD_STEMS.some((st) => (st.length <= 3 ? w === st : w.startsWith(st))));
+}
+
 const plain = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
 /** The first known city named in the text, as { name, countryCode }, or null. Longer stems win (so "novi sad" beats "sad"). */
@@ -423,10 +431,16 @@ export async function gatherLiveFacts({ location, trip, message = '', clientPlac
   if (w.status !== 'fulfilled') issues.push(`weather: ${String(w.reason?.message || w.reason).slice(0, 60)}`);
   const weather = w.status === 'fulfilled' ? parseWeather(w.value) : null;
   if (!weather) limitations.push('Live weather is not available right now.');
-  const places = p.status === 'fulfilled' ? parsePlaces(p.value, center) : [];
+  let places = p.status === 'fulfilled' ? parsePlaces(p.value, center) : [];
+  // RYDO-COMPANION-FOOD: a question about eating gets only food places, so the AI cannot answer with parks and museums.
+  const wantsFood = isFoodQuestion(message);
+  if (wantsFood && p.status === 'fulfilled') {
+    const all = parsePlaces(p.value, center, 200).filter((x) => x.group === 'food').slice(0, COMPANION_LIMITS.maxPlaces);
+    if (all.length >= 3) places = all.map((x, i) => ({ ...x, ref: `P${i + 1}` }));
+  }
   if (p.status !== 'fulfilled') limitations.push('Live nearby places are not available right now.');
   else if (!places.length) limitations.push('The map has no named places around this point.');
-  return { center, centerSource, centerName, weather, places, limitations, issues };
+  return { center, centerSource, centerName, weather, places, limitations, issues, wantsFood };
 }
 
 /* ------------------------------------------------------------------ prompt */
@@ -475,7 +489,7 @@ export function buildCompanionMessages({ message, history, language, trip, facts
     lines.push('Weather: NOT AVAILABLE.');
   }
   if (facts.places.length) {
-    lines.push('NEARBY PLACES (real, from OpenStreetMap; nearest first):');
+    lines.push(facts.wantsFood ? 'NEARBY FOOD PLACES (real, from OpenStreetMap; nearest first). The traveller asks about food: pick only from these.' : 'NEARBY PLACES (real, from OpenStreetMap; nearest first):');
     for (const p of facts.places) lines.push(`${p.ref} | ${p.name} | ${p.kind}${p.cuisine ? ` (${p.cuisine})` : ''} | ${p.distanceM} m`);
   } else {
     lines.push('NEARBY PLACES: NONE AVAILABLE. Do NOT name any restaurant, cafe, hotel, shop or other business, not even a well-known one. Tell the traveller (in the answer language, never in English unless the answer language is English) that the live map is not available right now and give only general tips (for example which kind of food is usually cheap); suggest trying again in a minute.');
