@@ -446,7 +446,7 @@ export function buildCompanionMessages({ message, history, language, trip, facts
     lines.push('NEARBY PLACES (real, from OpenStreetMap; nearest first):');
     for (const p of facts.places) lines.push(`${p.ref} | ${p.name} | ${p.kind}${p.cuisine ? ` (${p.cuisine})` : ''} | ${p.distanceM} m`);
   } else {
-    lines.push('NEARBY PLACES: NONE AVAILABLE. Do NOT name any restaurant, cafe, hotel, shop or other business, not even a well-known one. Say the live map is not available right now and give only general tips (for example which kind of food is usually cheap); suggest trying again in a minute.');
+    lines.push('NEARBY PLACES: NONE AVAILABLE. Do NOT name any restaurant, cafe, hotel, shop or other business, not even a well-known one. Tell the traveller (in the answer language, never in English unless the answer language is English) that the live map is not available right now and give only general tips (for example which kind of food is usually cheap); suggest trying again in a minute.');
   }
   if (trip) {
     lines.push(`TRIP: ${trip.title || 'Untitled'}${trip.destination ? `, ${trip.destination}` : ''}${trip.startDate ? `, ${trip.startDate}` : ''}${trip.endDate ? ` to ${trip.endDate}` : ''}`);
