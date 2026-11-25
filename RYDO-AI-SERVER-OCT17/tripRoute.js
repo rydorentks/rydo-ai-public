@@ -66,19 +66,19 @@ export function createUsageStore({ collection = 'travel_ai_usage', kind = 'trip'
  * in the query does not exist on this instance it retries with a simpler query. The eligibility check in trip.js removes
  * inactive cars anyway, so the simpler query is still safe.
  */
-export async function loadRentCars(pb) {
+export async function loadRentCars(pb, collection = 'cars') {
   const attempts = [{ filter: 'active != false', sort: '-created' }, { sort: '-created' }, {}];
   const out = [];
   let chosen = null;
   for (let page = 1; page <= 3; page++) {
     let list = null;
     if (chosen) {
-      list = await pb.collection('cars').getList(page, 200, chosen);
+      list = await pb.collection(collection).getList(page, 200, chosen);
     } else {
       let lastError;
       for (const options of attempts) {
         try {
-          list = await pb.collection('cars').getList(page, 200, options);
+          list = await pb.collection(collection).getList(page, 200, options);
           chosen = options;
           break;
         } catch (e) {
@@ -100,6 +100,38 @@ const endDate = (start, days) => {
   return d.toISOString().slice(0, 10);
 };
 
+/* ------------------------------------------------------------------ guests (RYDO-TRIP-GUEST) */
+
+/** The visitor's IP as Render forwards it (first x-forwarded-for entry). Only used as a counting key, never stored. */
+export function clientIp(req) {
+  const fwd = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  return (fwd || String(req?.ip || req?.socket?.remoteAddress || '')).slice(0, 64);
+}
+
+/**
+ * Limits for people without an account: `perDay` plans per IP in 24 h and `dailyCap` guest plans in total per 24 h
+ * (a cost guard). Kept in memory: it resets when the server restarts, which only ever gives a few extra free plans.
+ */
+export function createGuestLimiter({ perDay = 1, dailyCap = 200, now = () => Date.now() } = {}) {
+  const hits = new Map();
+  let all = [];
+  return {
+    check(ip) {
+      const t = now();
+      all = all.filter((x) => t - x < 86400000);
+      const key = String(ip || 'unknown');
+      const list = (hits.get(key) || []).filter((x) => t - x < 86400000);
+      if (list.length >= perDay) return { ok: false, reason: 'guest_day', retryAfter: 3600 };
+      if (all.length >= dailyCap) return { ok: false, reason: 'guest_cap', retryAfter: 3600 };
+      list.push(t);
+      all.push(t);
+      hits.set(key, list);
+      if (hits.size > 20000) for (const [k, v] of hits) if (!v.some((x) => t - x < 86400000)) hits.delete(k);
+      return { ok: true };
+    },
+  };
+}
+
 /* ------------------------------------------------------------------ the handler */
 
 export function createTripHandler({
@@ -116,6 +148,7 @@ export function createTripHandler({
   totalTimeoutMs = 80000,
   now = () => Date.now(),
   logger = console,
+  guest = null, // RYDO-TRIP-GUEST: { limiter, makePb } -> one free plan without an account; null = account required
 }) {
   return async function tripHandler(req, res) {
     try {
@@ -124,10 +157,22 @@ export function createTripHandler({
 
       let pb;
       let user;
-      try {
-        ({ pb, user } = await getAuthenticatedUser(req));
-      } catch {
-        return res.status(401).json({ error: 'Your RYDO session has expired. Please log in again.' });
+      // RYDO-TRIP-GUEST: no session at all (not an expired one) = a visitor. A sent but invalid token still answers 401.
+      const hasAuth = /^bearer\s+\S+/i.test(String(req?.headers?.authorization || ''));
+      const isGuest = !hasAuth && !!guest;
+      if (isGuest) {
+        try {
+          pb = guest.makePb();
+        } catch {
+          return res.status(503).json({ error: 'Something went wrong. Please try again.' });
+        }
+        user = { id: `guest:${clientIp(req)}` };
+      } else {
+        try {
+          ({ pb, user } = await getAuthenticatedUser(req));
+        } catch {
+          return res.status(401).json({ error: 'Your RYDO session has expired. Please log in again.' });
+        }
       }
       const userId = String(user?.id || '');
       if (!userId) return res.status(401).json({ error: 'Your RYDO session has expired. Please log in again.' });
@@ -148,9 +193,18 @@ export function createTripHandler({
           retryAfter,
         });
       };
-      const quick = limiter.check(userId);
+      if (isGuest) {
+        // Guests get one fresh plan; changing a plan needs an account (it is a second AI call).
+        if (input.mode === 'refine') return res.status(401).json({ error: 'Sign in to change your plan.', code: 'guest_signin' });
+        const g = guest.limiter.check(userId);
+        if (!g.ok) {
+          res.set('Retry-After', String(g.retryAfter));
+          return res.status(429).json({ error: 'You used your free plan for today. Sign in to make more plans.', code: 'guest_limit', retryAfter: g.retryAfter });
+        }
+      }
+      const quick = isGuest ? { ok: true } : limiter.check(userId);
       if (!quick.ok) return deny(quick.reason, quick.retryAfter);
-      if (usageStore) {
+      if (usageStore && !isGuest) {
         try {
           const saved = await usageStore.check(pb, userId);
           if (!saved.ok) return deny(saved.reason, saved.retryAfter);
@@ -200,7 +254,8 @@ export function createTripHandler({
           try {
             const dayCount = result.plan.days.length;
             const from = result.plan.startDate || '';
-            const records = await loadRentCars(pb);
+            // Guests read the public car list (the same one Rent shows to everyone).
+            const records = isGuest ? await loadRentCars(pb, 'cars_public') : await loadRentCars(pb);
             cars = matchCars(records, result.plan.carPickupCity || input.prefs.departureCity, 3, { from, to: endDate(from, dayCount), today });
           } catch (e) {
             logger.warn('RYDO AI trip: could not load Rent cars:', e?.message || e);
@@ -210,7 +265,8 @@ export function createTripHandler({
         addCarToBudget(result.plan, cars); // RYDO-TRIP-FIX: the real car price is part of the estimate
       }
 
-      logger.log(`RYDO AI trip: user=${userId} mode=${input.mode} type=${result.type} model=${result.model}`);
+      result.guest = isGuest; // RYDO-TRIP-GUEST: the app asks the visitor to sign in to save the plan
+      logger.log(`RYDO AI trip: user=${isGuest ? 'guest' : userId} mode=${input.mode} type=${result.type} model=${result.model}`);
       return res.json(result);
     } catch (error) {
       logger.error('RYDO AI trip error:', error?.message || error);
