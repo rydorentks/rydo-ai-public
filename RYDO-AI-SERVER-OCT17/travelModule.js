@@ -11,8 +11,9 @@
  *
  * A wrong Travel configuration can never stop the server or Rent: the Travel route just answers 503 and the health route says why.
  */
+import PocketBase from 'pocketbase';
 import { createTripLimiter, splitModels } from './trip.js';
-import { cleanKey, createTripHandler, createUsageStore, isTripEnabled } from './tripRoute.js';
+import { cleanKey, createGuestLimiter, createTripHandler, createUsageStore, isTripEnabled } from './tripRoute.js';
 import { createFetchJson, isCompanionEnabled } from './companion.js';
 import { companionLimiter, createCompanionHandler, createSuggestHandler, suggestLimiter } from './companionRoute.js';
 
@@ -30,6 +31,8 @@ export function readTravelConfig(env = {}) {
     model,
     fallbacks: splitModels(env.OPENROUTER_TRIP_FALLBACK_MODELS),
     usageCollection: !usageRaw || usageRaw.toLowerCase() === 'off' ? '' : usageRaw,
+    guestEnabled: !['off', 'false', '0', 'no'].includes(String(env.TRAVEL_GUEST_ENABLED ?? '').trim().toLowerCase()),
+    guestDailyCap: Math.min(5000, Math.max(1, Math.round(Number(env.TRAVEL_GUEST_DAILY_CAP) || 200))),
     problems,
   };
 }
@@ -67,6 +70,10 @@ export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthen
         limiter: createTripLimiter(),
         usageStore: config.usageCollection ? createUsageStore({ collection: config.usageCollection }) : null,
         logger,
+        // RYDO-TRIP-GUEST: one free plan per visitor per day without an account. Turn off with TRAVEL_GUEST_ENABLED=off.
+        guest: config.guestEnabled
+          ? { limiter: createGuestLimiter({ perDay: 1, dailyCap: config.guestDailyCap }), makePb: () => new PocketBase(pbUrl) }
+          : null,
       }),
     );
     // Travel Companion + AI experience suggestions: own switch (TRAVEL_COMPANION_ENABLED), off by default. Same Travel key and models.
