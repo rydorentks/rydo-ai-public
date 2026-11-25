@@ -6,6 +6,7 @@
  */
 import {
   TRIP_LIMITS,
+  addCarToBudget,
   TripError,
   buildModelSequence,
   buildTripMessages,
@@ -174,7 +175,8 @@ export function createTripHandler({
         }
         try {
           const completion = await openrouter.chat.completions.create(
-            { model: candidate, messages, temperature: 0.4, max_tokens: 3800 },
+            // RYDO-TRIP-FIX: json_object makes models answer with clean JSON (OpenRouter ignores it for models without support).
+            { model: candidate, messages, temperature: 0.3, max_tokens: 3800, response_format: { type: 'json_object' } },
             { timeout: attemptTimeoutMs, maxRetries: 0 },
           );
           const content = extractContent(completion);
@@ -205,6 +207,7 @@ export function createTripHandler({
           }
         }
         result.cars = cars;
+        addCarToBudget(result.plan, cars); // RYDO-TRIP-FIX: the real car price is part of the estimate
       }
 
       logger.log(`RYDO AI trip: user=${userId} mode=${input.mode} type=${result.type} model=${result.model}`);
