@@ -90,6 +90,8 @@ export function mountTravelAI({ app, OpenAI, env = process.env, pbUrl, getAuthen
       };
       app.post('/v1/ai/companion', createCompanionHandler({
         ...shared,
+        // RYDO-TRIP-GUEST: 3 free Companion questions per visitor per day (same switch as guest plans).
+        guest: config.guestEnabled ? { limiter: createGuestLimiter({ perDay: 3, dailyCap: config.guestDailyCap * 3 }), makePb: () => new PocketBase(pbUrl) } : null,
         limiter: companionLimiter(),
         usageStore: config.usageCollection ? createUsageStore({ collection: config.usageCollection, kind: 'companion' }) : null,
         fetchJson: fetchJson || createFetchJson(),
