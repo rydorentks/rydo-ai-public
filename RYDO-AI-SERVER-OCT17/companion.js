@@ -211,6 +211,40 @@ export function parseGeocode(raw) {
   return { lat, lng, name: cleanText(r.name, 80), country: cleanText(r.country, 60) };
 }
 
+/* RYDO-COMPANION-PHOTON: Photon (komoot) searches the same OpenStreetMap data and answers fast; the Overpass server is often
+ * too slow or refuses shared cloud IPs. Each word is one small search inside a box around the reference point. */
+export const PHOTON_WORDS = Object.freeze(['restaurant', 'qebaptore', 'pizza', 'fast food', 'cafe', 'museum', 'monument', 'park']);
+const PHOTON_ALLOWED = Object.freeze({
+  amenity: /^(restaurant|cafe|fast_food)$/,
+  tourism: /^(attraction|museum|viewpoint|gallery)$/,
+  historic: /^(castle|monument|memorial|ruins|archaeological_site|fort)$/,
+  leisure: /^(park|nature_reserve)$/,
+  natural: /^(waterfall|peak|spring)$/,
+});
+
+export function buildPhotonUrl(word, lat, lng, radius = COMPANION_LIMITS.radiusMeters) {
+  const dLat = radius / 111320;
+  const dLng = radius / (111320 * Math.max(0.2, Math.cos((lat * Math.PI) / 180)));
+  const box = [lng - dLng, lat - dLat, lng + dLng, lat + dLat].map((x) => x.toFixed(5)).join(',');
+  return `https://photon.komoot.io/api/?q=${encodeURIComponent(word)}&bbox=${box}&limit=12&lang=en`;
+}
+
+/** Photon answers -> the same { elements } shape as Overpass, keeping only the kinds of places we list. */
+export function photonToElements(answers) {
+  const elements = [];
+  for (const raw of Array.isArray(answers) ? answers : []) {
+    for (const f of Array.isArray(raw?.features) ? raw.features : []) {
+      const pr = isObj(f?.properties) ? f.properties : {};
+      const c = Array.isArray(f?.geometry?.coordinates) ? f.geometry.coordinates : [];
+      const key = String(pr.osm_key || '');
+      const value = String(pr.osm_value || '');
+      if (!PHOTON_ALLOWED[key] || !PHOTON_ALLOWED[key].test(value) || !pr.name) continue;
+      elements.push({ lat: c[1], lon: c[0], tags: { [key]: value, name: pr.name } });
+    }
+  }
+  return { elements };
+}
+
 const PLACE_GROUPS = [
   { group: 'food', filter: '["amenity"~"^(restaurant|cafe|fast_food)$"]' },
   { group: 'sights', filter: '["tourism"~"^(attraction|museum|viewpoint|gallery)$"]' },
@@ -307,16 +341,37 @@ export async function gatherLiveFacts({ location, trip, message = '' }, fetchJso
   if (centerSource === 'destination') limitations.push('Your location is off, so these results are around the trip destination, not around you.');
   if (centerSource === 'message') limitations.push(`These places are around the centre of ${centerName}. Prices and opening hours are not known; check before you go.`);
 
+  const issues = []; // why a live source failed; logged by the route, never sent to the traveller
+  const placesBody = `data=${encodeURIComponent(buildPlacesQuery(center.lat, center.lng))}`;
+  // Overpass (richer: cuisine) and Photon (fast) side by side; Overpass wins when it answers in time with enough places.
+  const askPlaces = async () => {
+    const [o, ph] = await Promise.allSettled([
+      fetchJson('https://overpass-api.de/api/interpreter', { timeoutMs: Math.min(timeoutMs, 6000), method: 'POST', body: placesBody }),
+      Promise.allSettled(PHOTON_WORDS.map((word) => fetchJson(buildPhotonUrl(word, center.lat, center.lng), { timeoutMs: Math.min(timeoutMs, 6000) }))),
+    ]);
+    if (o.status !== 'fulfilled') issues.push(`overpass: ${String(o.reason?.message || o.reason).slice(0, 60)}`);
+    if (o.status === 'fulfilled' && parsePlaces(o.value, center).length >= 5) return o.value;
+    const answers = ph.status === 'fulfilled' ? ph.value.filter((r) => r.status === 'fulfilled').map((r) => r.value) : [];
+    if (!answers.length) {
+      issues.push('photon: no answer');
+      if (o.status === 'fulfilled') return o.value;
+      throw new Error('no places source answered');
+    }
+    const fromPhoton = photonToElements(answers);
+    if (o.status === 'fulfilled') fromPhoton.elements.push(...(Array.isArray(o.value?.elements) ? o.value.elements : []));
+    return fromPhoton;
+  };
   const [w, p] = await Promise.allSettled([
     fetchJson(buildWeatherUrl(center.lat, center.lng), { timeoutMs }),
-    fetchJson('https://overpass-api.de/api/interpreter', { timeoutMs, method: 'POST', body: `data=${encodeURIComponent(buildPlacesQuery(center.lat, center.lng))}` }),
+    askPlaces(),
   ]);
+  if (w.status !== 'fulfilled') issues.push(`weather: ${String(w.reason?.message || w.reason).slice(0, 60)}`);
   const weather = w.status === 'fulfilled' ? parseWeather(w.value) : null;
   if (!weather) limitations.push('Live weather is not available right now.');
   const places = p.status === 'fulfilled' ? parsePlaces(p.value, center) : [];
   if (p.status !== 'fulfilled') limitations.push('Live nearby places are not available right now.');
   else if (!places.length) limitations.push('The map has no named places around this point.');
-  return { center, centerSource, centerName, weather, places, limitations };
+  return { center, centerSource, centerName, weather, places, limitations, issues };
 }
 
 /* ------------------------------------------------------------------ prompt */
@@ -368,7 +423,7 @@ export function buildCompanionMessages({ message, history, language, trip, facts
     lines.push('NEARBY PLACES (real, from OpenStreetMap; nearest first):');
     for (const p of facts.places) lines.push(`${p.ref} | ${p.name} | ${p.kind}${p.cuisine ? ` (${p.cuisine})` : ''} | ${p.distanceM} m`);
   } else {
-    lines.push('NEARBY PLACES: NONE AVAILABLE.');
+    lines.push('NEARBY PLACES: NONE AVAILABLE. Do NOT name any restaurant, cafe, hotel, shop or other business, not even a well-known one. Say the live map is not available right now and give only general tips (for example which kind of food is usually cheap); suggest trying again in a minute.');
   }
   if (trip) {
     lines.push(`TRIP: ${trip.title || 'Untitled'}${trip.destination ? `, ${trip.destination}` : ''}${trip.startDate ? `, ${trip.startDate}` : ''}${trip.endDate ? ` to ${trip.endDate}` : ''}`);
