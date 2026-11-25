@@ -339,7 +339,7 @@ export async function gatherLiveFacts({ location, trip, message = '' }, fetchJso
     return { center: null, centerSource, weather: null, places: [], limitations };
   }
   if (centerSource === 'destination') limitations.push('Your location is off, so these results are around the trip destination, not around you.');
-  if (centerSource === 'message') limitations.push(`These places are around the centre of ${centerName}. Prices and opening hours are not known; check before you go.`);
+  if (centerSource === 'message') limitations.push('These places are around the centre of the city in your question. Prices and opening hours are not known; check before you go.'); // fixed text so the app can translate it
 
   const issues = []; // why a live source failed; logged by the route, never sent to the traveller
   const placesBody = `data=${encodeURIComponent(buildPlacesQuery(center.lat, center.lng))}`;
@@ -395,7 +395,7 @@ export function buildCompanionMessages({ message, history, language, trip, facts
     '- When you recommend a nearby place, put its ref in "picks" (P1, P2...). Do not name a place that is not in the list unless you say it is general knowledge and may be wrong.',
     '- For "reorganize because of weather": if the forecast is wet or stormy, suggest moving outdoor items (activity, tour, walking, nature) to a dry day or time, or replacing them with indoor places from the list. Put moved items in "reorder" with a new startTime (HH:MM). You only SUGGEST; the traveller decides.',
     '- Distances are straight-line from the reference point, not driving time. Say so when it matters. You have no live road or public transport data.',
-    '- You cannot see prices. If the traveller asks for something cheap, prefer places whose kind or cuisine suggests a low price (fast food, bakery, traditional grill, cafe) and say that prices are not known.',
+    '- You cannot see prices. Never say that a place is cheap, has low prices or shows low prices. If the traveller asks for something cheap, prefer kinds of places that are usually cheaper (fast food, bakery, traditional grill, cafe), call them "usually cheaper kinds of places", and say that prices are not known.',
     '- When the traveller asks where to eat or what to see, pick 3 to 5 places from the list with a short reason each.',
     '- Be short, friendly and practical.',
     `- Write all text in ${languageName(language)}. Keep JSON keys in English.`,
