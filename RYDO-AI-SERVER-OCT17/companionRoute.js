@@ -156,6 +156,7 @@ export function createCompanionHandler({
 
       // Live data first. It never throws: a missing source becomes a limitation that the server adds to the answer.
       const facts = await gatherLiveFacts({ location: input.location, trip: input.trip, message: input.message }, fetchJson);
+      if (facts.issues?.length) logger.warn(`RYDO AI companion live data: ${facts.issues.join(' | ')}`);
       const today = new Date(now()).toISOString().slice(0, 10);
       const messages = buildCompanionMessages({ message: input.message, history: input.history, language: input.language, trip: input.trip, facts, today });
       const sequence = buildModelSequence({ ...models, max: maxAttempts });
