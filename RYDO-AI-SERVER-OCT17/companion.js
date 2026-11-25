@@ -213,6 +213,8 @@ export function parseGeocode(raw) {
 
 /* RYDO-COMPANION-PHOTON: Photon (komoot) searches the same OpenStreetMap data and answers fast; the Overpass server is often
  * too slow or refuses shared cloud IPs. Each word is one small search inside a box around the reference point. */
+const PLACES_CACHE = new Map();
+const PLACES_CACHE_MS = 6 * 60 * 60 * 1000;
 export const PHOTON_WORDS = Object.freeze(['restaurant', 'qebaptore', 'pizza', 'fast food', 'cafe', 'museum', 'monument', 'park']);
 const PHOTON_ALLOWED = Object.freeze({
   amenity: /^(restaurant|cafe|fast_food)$/,
@@ -344,22 +346,43 @@ export async function gatherLiveFacts({ location, trip, message = '' }, fetchJso
   const issues = []; // why a live source failed; logged by the route, never sent to the traveller
   const placesBody = `data=${encodeURIComponent(buildPlacesQuery(center.lat, center.lng))}`;
   // Overpass (richer: cuisine) and Photon (fast) side by side; Overpass wins when it answers in time with enough places.
-  const askPlaces = async () => {
+  // RYDO-COMPANION-CACHE: good answers are kept 6 hours per point, so repeat questions do not depend on the free map servers.
+  const cacheKey = `${center.lat.toFixed(3)},${center.lng.toFixed(3)}`;
+  const askPhoton = (words) => Promise.allSettled(words.map((word) => fetchJson(buildPhotonUrl(word, center.lat, center.lng), { timeoutMs: Math.min(timeoutMs, 6000) })));
+  const fetchPlaces = async () => {
     const [o, ph] = await Promise.allSettled([
       fetchJson('https://overpass-api.de/api/interpreter', { timeoutMs: Math.min(timeoutMs, 6000), method: 'POST', body: placesBody }),
-      Promise.allSettled(PHOTON_WORDS.map((word) => fetchJson(buildPhotonUrl(word, center.lat, center.lng), { timeoutMs: Math.min(timeoutMs, 6000) }))),
+      askPhoton(PHOTON_WORDS),
     ]);
     if (o.status !== 'fulfilled') issues.push(`overpass: ${String(o.reason?.message || o.reason).slice(0, 60)}`);
     if (o.status === 'fulfilled' && parsePlaces(o.value, center).length >= 5) return o.value;
-    const answers = ph.status === 'fulfilled' ? ph.value.filter((r) => r.status === 'fulfilled').map((r) => r.value) : [];
+    let answers = ph.status === 'fulfilled' ? ph.value.filter((r) => r.status === 'fulfilled').map((r) => r.value) : [];
     if (!answers.length) {
-      issues.push('photon: no answer');
+      const why = ph.status === 'fulfilled' ? ph.value.find((r) => r.status === 'rejected')?.reason : ph.reason;
+      issues.push(`photon: ${String(why?.message || why || 'no answer').slice(0, 60)}`);
+      // One calmer second try with fewer words.
+      await new Promise((r) => setTimeout(r, 800));
+      const again = await askPhoton(PHOTON_WORDS.slice(0, 4));
+      answers = again.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+      if (answers.length) issues.push('photon: second try worked');
+    }
+    if (!answers.length) {
       if (o.status === 'fulfilled') return o.value;
       throw new Error('no places source answered');
     }
     const fromPhoton = photonToElements(answers);
     if (o.status === 'fulfilled') fromPhoton.elements.push(...(Array.isArray(o.value?.elements) ? o.value.elements : []));
     return fromPhoton;
+  };
+  const askPlaces = async () => {
+    const hit = PLACES_CACHE.get(cacheKey);
+    if (hit && Date.now() - hit.at < PLACES_CACHE_MS) return hit.raw;
+    const raw = await fetchPlaces();
+    if (parsePlaces(raw, center).length) {
+      if (PLACES_CACHE.size >= 300) PLACES_CACHE.delete(PLACES_CACHE.keys().next().value);
+      PLACES_CACHE.set(cacheKey, { at: Date.now(), raw });
+    }
+    return raw;
   };
   const [w, p] = await Promise.allSettled([
     fetchJson(buildWeatherUrl(center.lat, center.lng), { timeoutMs }),
