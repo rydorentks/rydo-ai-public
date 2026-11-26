@@ -4,6 +4,7 @@ import express from 'express';
 import OpenAI from 'openai';
 import PocketBase from 'pocketbase';
 import { mountTravelAI } from './travelModule.js'; // RYDO-TRIP
+import { createChatQuota } from './chatPlan.js'; // RYDO-AI-PLUS
 
 dotenv.config({
   path: new URL('./.env', import.meta.url),
@@ -26,6 +27,12 @@ app.use(
 const PB_URL = process.env.POCKETBASE_URL || '';
 const MODEL =
   process.env.OPENROUTER_MODEL || 'openrouter/free';
+
+/* RYDO-AI-PLUS: daily allowance; CHAT_USAGE_COLLECTION=off turns the counting off. */
+const CHAT_USAGE_RAW = String(process.env.CHAT_USAGE_COLLECTION ?? 'travel_ai_usage').trim();
+const CHAT_QUOTA = CHAT_USAGE_RAW && CHAT_USAGE_RAW.toLowerCase() !== 'off'
+  ? createChatQuota({ collection: CHAT_USAGE_RAW })
+  : { check: async () => ({ ok: true, plan: 'free', usage: null }), record: async () => null };
 
 /*
  * Free models are often busy or return an empty answer.
@@ -3755,6 +3762,19 @@ app.post(
         `RYDO AI request: user=${user.id} role=${role}`,
       );
 
+      // RYDO-AI-PLUS: 5 free questions a day (from midnight, Kosovo time); RYDO AI Plus up to 100; admins unlimited.
+      const quota = await CHAT_QUOTA.check(pb, user, role);
+      if (!quota.ok) {
+        return res.status(429).json({
+          error: quota.plan === 'plus'
+            ? 'You reached today\'s RYDO AI Plus limit. Try again tomorrow.'
+            : 'You used your 5 free RYDO AI questions for today. You get 5 new ones tomorrow, or switch to RYDO AI Plus.',
+          code: 'chat_limit',
+          usage: quota.usage,
+        });
+      }
+      const finish = async (body) => res.json({ ...body, usage: await CHAT_QUOTA.record(pb, user, quota) });
+
       const context =
         await buildContext(
           pb,
@@ -3896,7 +3916,7 @@ ${JSON.stringify(
             fallbackPlans.carId,
           );
 
-          return res.json({
+          return finish({
             content:
               `E analizova flotën aktuale tënde dhe çmimet nga PocketBase. ` +
               `Veturën që do ta promovoja është **${fallbackPlans.carTitle}**.\n\n` +
@@ -4016,7 +4036,7 @@ ${JSON.stringify(
           : 'none',
       );
 
-      return res.json({
+      return finish({
         content:
           finalContent,
 
