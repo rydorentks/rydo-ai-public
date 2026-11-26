@@ -101,9 +101,38 @@ export function parseCompanionRequest(body) {
     trip: cleanTripContext(body.trip),
     // RYDO-COMPANION-CLIENT-PLACES: places the app looked up itself (the free map servers often refuse our cloud server).
     clientPlaces: cleanClientPlaces(body.places),
+    clientWeather: cleanClientWeather(body.weather),
     placesCenter: cleanCoord(body.placesCenter?.lat, -90, 90) !== null && cleanCoord(body.placesCenter?.lng, -180, 180) !== null
       ? { lat: cleanCoord(body.placesCenter.lat, -90, 90), lng: cleanCoord(body.placesCenter.lng, -180, 180) }
       : null,
+  };
+}
+
+/** Weather sent by the app (Open-Meteo answer, read from the phone because Open-Meteo often refuses our cloud server).
+ * Only plain numbers and dates are kept; parseWeather checks them again. */
+export function cleanClientWeather(raw) {
+  if (!isObj(raw) || !isObj(raw.daily) || !Array.isArray(raw.daily.time)) return null;
+  const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
+  const d = raw.daily;
+  const c = isObj(raw.current) ? raw.current : {};
+  const daily = { time: [], weather_code: [], temperature_2m_max: [], temperature_2m_min: [], precipitation_probability_max: [] };
+  for (let i = 0; i < Math.min(3, d.time.length); i++) {
+    const date = String(d.time[i]).slice(0, 10);
+    const code = num(d.weather_code?.[i]);
+    const max = num(d.temperature_2m_max?.[i]);
+    const min = num(d.temperature_2m_min?.[i]);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || code === null || max === null || min === null) continue; // a bad day is dropped, never guessed
+    daily.time.push(date);
+    daily.weather_code.push(code);
+    daily.temperature_2m_max.push(max);
+    daily.temperature_2m_min.push(min);
+    daily.precipitation_probability_max.push(num(d.precipitation_probability_max?.[i]) ?? NaN);
+  }
+  if (!daily.time.length) return null;
+  const temp = num(c.temperature_2m);
+  return {
+    current: temp === null ? null : { temperature_2m: temp, weather_code: num(c.weather_code) ?? NaN, wind_speed_10m: num(c.wind_speed_10m) ?? NaN },
+    daily,
   };
 }
 
@@ -332,7 +361,7 @@ export function parsePlaces(raw, center, max = COMPANION_LIMITS.maxPlaces) {
  * Collects the live facts for one question. Every source is optional and has its own timeout; a failure only adds a limitation.
  * Returns { center, centerSource, weather, places, limitations }.
  */
-export async function gatherLiveFacts({ location, trip, message = '', clientPlaces = [], placesCenter = null }, fetchJson, { timeoutMs = 9000 } = {}) {
+export async function gatherLiveFacts({ location, trip, message = '', clientPlaces = [], placesCenter = null, clientWeather = null }, fetchJson, { timeoutMs = 9000 } = {}) {
   const limitations = [];
   let center = null;
   let centerSource = 'none';
@@ -424,12 +453,14 @@ export async function gatherLiveFacts({ location, trip, message = '', clientPlac
     }
     return raw;
   };
+  // RYDO-COMPANION-CLIENT-WEATHER: weather the app read for (almost) the same point is used as is.
+  const fromApp = clientWeather && placesCenter && distanceMeters(center, placesCenter) <= 20000 ? parseWeather(clientWeather) : null;
   const [w, p] = await Promise.allSettled([
-    fetchJson(buildWeatherUrl(center.lat, center.lng), { timeoutMs }),
+    fromApp ? Promise.resolve(null) : fetchJson(buildWeatherUrl(center.lat, center.lng), { timeoutMs }),
     askPlaces(),
   ]);
-  if (w.status !== 'fulfilled') issues.push(`weather: ${String(w.reason?.message || w.reason).slice(0, 60)}`);
-  const weather = w.status === 'fulfilled' ? parseWeather(w.value) : null;
+  if (!fromApp && w.status !== 'fulfilled') issues.push(`weather: ${String(w.reason?.message || w.reason).slice(0, 60)}`);
+  const weather = fromApp || (w.status === 'fulfilled' ? parseWeather(w.value) : null);
   if (!weather) limitations.push('Live weather is not available right now.');
   let places = p.status === 'fulfilled' ? parsePlaces(p.value, center) : [];
   // RYDO-COMPANION-FOOD: a question about eating gets only food places, so the AI cannot answer with parks and museums.
